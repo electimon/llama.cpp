@@ -1595,16 +1595,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
-                        ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        // For strided tensors, ggml_nbytes() returns the memory span (including gaps),
+                        // not the actual data size. Copy row by row for strided tensors.
+                        const int64_t ne0 = ids_tensor->ne[0];
+                        const int64_t ne1 = ids_tensor->ne[1];
+                        const size_t row_size = ne0 * sizeof(int32_t);
+                        ids.resize(ne0 * ne1);
+
+                        if (ggml_is_contiguous(ids_tensor)) {
+                            ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, row_size * ne1);
+                        } else {
+                            // Copy each row separately for strided tensors
+                            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                                ggml_backend_tensor_get_async(ids_backend, ids_tensor,
+                                    ids.data() + i1 * ne0, i1 * ids_tensor->nb[1], row_size);
+                            }
+                        }
                         ggml_backend_synchronize(ids_backend);
 
-                        // find the used experts
+                        // find the used experts (use contiguous indexing since we copied to contiguous buffer)
                         used_ids.clear();
                         used_ids.resize(ggml_bitset_size(n_expert));
-                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                        for (int64_t i1 = 0; i1 < ne1; i1++) {
+                            for (int64_t i0 = 0; i0 < ne0; i0++) {
+                                int32_t id = ids[i1 * ne0 + i0];
                                 GGML_ASSERT(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }

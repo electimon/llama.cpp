@@ -3859,11 +3859,30 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         return;
     }
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
+    // Copy ids tensor to host. For strided tensors, ggml_nbytes() returns the
+    // memory span (including gaps), not the actual data size. We must copy
+    // row-by-row for strided tensors to avoid out-of-bounds device reads.
+    const size_t ids_ne0 = ids->ne[0];
+    const size_t ids_ne1 = ids->ne[1];
+    const size_t host_row_stride = ids_ne0 * sizeof(int32_t);  // Contiguous stride in host buffer
+    const size_t ids_actual_size = host_row_stride * ids_ne1;
+
+    std::vector<char> ids_host(ids_actual_size);
     const char * ids_dev = (const char *) ids->data;
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
+    if (ggml_is_contiguous(ids)) {
+        // Single memcpy is safe for contiguous tensors
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            stream->memcpy(ids_host.data(), ids_dev, ids_actual_size)));
+    } else {
+        // Copy row by row for strided tensors to avoid reading beyond allocated memory
+        for (size_t row = 0; row < ids_ne1; row++) {
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                stream->memcpy(ids_host.data() + row * host_row_stride,
+                               ids_dev + row * ids->nb[1],
+                               host_row_stride)));
+        }
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
 
     ggml_tensor src0_row = *src0;
@@ -3892,7 +3911,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     if (ne12 == 1) {
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*host_row_stride + id*sizeof(int32_t));
                 GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                 const int64_t i11 = id % ne11;
@@ -3919,7 +3938,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             int64_t num_src1_rows = 0;
             for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
                 for (int64_t id = 0; id < n_ids; id++) {
-                    const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                    const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*host_row_stride + id*sizeof(int32_t));
 
                     GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
 
@@ -4450,6 +4469,9 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
+    // Synchronize to avoid device lost errors when copying from unpinned host memory
+    // This is a workaround for Level Zero/Intel Arc GPU issues with async H2D transfers
+    SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
